@@ -1,0 +1,47 @@
+{
+  "dataset": {
+    "sampling": {
+      "limits_rotation": 1.4,
+      "limits_translation": 0.5,
+      "canonical": false
+    },
+    "noise": {
+      "source": false,
+      "target": false
+    },
+    "correspondence": {
+      "distance": 0.0025
+    },
+    "min_correspondence": 0.0,
+    "sets": {
+      "train": {
+        "shard": 0.8
+      }
+    },
+    "points": 1024,
+    "translation_good": 0.01,
+    "archives": {
+      "path": "you/need/to/set/me",
+      "sets": {
+        "train": [
+          "ply_data_train0.h5",
+          "ply_data_train1.h5",
+          "ply_data_train2.h5",
+          "ply_data_train3.h5",
+          "ply_data_train4.h5"
+        ],
+        "val": [
+          "ply_data_train0.h5",
+          "ply_data_train1.h5",
+          "ply_data_train2.h5",
+          "ply_data_train3.h5",
+          "ply_data_train4.h5"
+        ],
+        "test": [
+          "ply_data_test0.h5",
+          "ply_data_test1.h5"
+        ]
+      }
+    }
+  }
+}

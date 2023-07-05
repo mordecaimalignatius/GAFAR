@@ -1,0 +1,9 @@
+# ignore vim swap files
+.*.swp
+
+# ignore python pyc
+*.pyc
+**/__pycache__
+
+# pycharm .idea stuff
+.idea/*
