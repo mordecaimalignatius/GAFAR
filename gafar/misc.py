@@ -5,12 +5,13 @@ Ludwig Mohr
 ludwig.mohr@icg.tugraz.at
 
 """
+
 import torch
 from math import log, exp
 from typing import Union
 
 
-################################################################################
+########################################################################################################################
 def normalize_3d_points_sphere(points_0, points_1):
     """ normalize 3D point clouds jointly to sit centered within the unit-sphere """
     points_0_mean = torch.mean(points_0, dim=1, keepdim=True)
@@ -25,7 +26,7 @@ def normalize_3d_points_sphere(points_0, points_1):
     return points_0_centered, points_1_centered, points_length
 
 
-################################################################################
+########################################################################################################################
 def log_sinkhorn_iterations(Z, log_mu, log_nu, iters: int):
     """
     from SuperGlue/Magic Leap
@@ -38,7 +39,6 @@ def log_sinkhorn_iterations(Z, log_mu, log_nu, iters: int):
     return Z + u.unsqueeze(2) + v.unsqueeze(1)
 
 
-################################################################################
 def log_optimal_transport(scores, alpha, iters: int):
     """
     from SuperGlue/Magic Leap
@@ -65,7 +65,71 @@ def log_optimal_transport(scores, alpha, iters: int):
     return Z
 
 
-################################################################################
+########################################################################################################################
+def log_sinkhorn_iterations_masked(Z, log_mu, log_nu, mask_m, mask_n, iters: int):
+    """
+    adapted from SuperGlue/Magic Leap
+    Perform Sinkhorn Normalization in Log-space for stability, masking out invalid values
+    """
+    u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
+    invalid_m, invalid_n = torch.logical_not(mask_m), torch.logical_not(mask_n)
+    log_mu[invalid_m] = 0.0
+    log_nu[invalid_n] = 0.0
+    for _ in range(iters):
+        # u = log_mu - torch.logsumexp(Z + v.unsqueeze(1), dim=2)
+        update = ((Z + v.unsqueeze(1)).exp() * mask_n.unsqueeze(1)).sum(2)
+        update[invalid_m] = 1.0     # this probably is unnecessary
+        u = log_mu - update.log()
+        u[invalid_m] = 0.0
+        # v = log_nu - torch.logsumexp(Z + u.unsqueeze(2), dim=1)
+        update = ((Z + u.unsqueeze(2)).exp() * mask_m.unsqueeze(2)).sum(1)
+        update[invalid_n] = 1.0
+        v = log_nu - update.log()
+        v[invalid_n] = 0.0
+    return Z + u.unsqueeze(2) + v.unsqueeze(1)
+
+
+def log_optimal_transport_masked(
+        scores: torch.Tensor,
+        alpha: torch.Tensor,
+        mask_m: torch.Tensor,
+        mask_n: torch.Tensor,
+        iters: int):
+    """
+    adapted from SuperGlue/Magic Leap
+    Perform Differentiable Optimal Transport in Log-space for stability, masking out invalid values
+    """
+    b, m, n = scores.shape
+    # one = scores.new_tensor(1)
+    # ms, ns = (m*one).to(scores), (n*one).to(scores)
+    ms = mask_m.sum(-1).to(scores)
+    ns = mask_n.sum(-1).to(scores)
+
+    bins0 = alpha.expand(b, m, 1)
+    bins1 = alpha.expand(b, 1, n)
+    alpha = alpha.expand(b, 1, 1)
+
+    couplings = torch.cat([torch.cat([scores, bins0], -1),
+                           torch.cat([bins1, alpha], -1)], 1)
+
+    norm = - (ms + ns).log().view(-1, 1)
+    # log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
+    log_mu = torch.cat([norm.expand(-1, m), ns.log()[:, None] + norm], dim=1)
+    # log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
+    log_nu = torch.cat([norm.expand(-1, n), ms.log()[:, None] + norm], dim=1)
+    # log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
+
+    true = mask_m.new_tensor(1).view(1, 1).expand(b, 1)
+    mask_m = torch.cat((mask_m, true), dim=1)
+    mask_n = torch.cat((mask_n, true), dim=1)
+    Z = log_sinkhorn_iterations_masked(couplings, log_mu, log_nu, mask_m, mask_n, iters)
+    Z = Z - norm.unsqueeze(-1)  # multiply probabilities by M+N
+    # mask entries
+    mask = torch.logical_and(mask_m.unsqueeze(2), mask_n.unsqueeze(1))
+    return torch.where(mask, Z, Z.new_tensor(-100))
+
+
+########################################################################################################################
 def get_layers_geometric(start: int, stop: int, step: int) -> list[int]:
     """
     get an approximately geometric series from <start> to <stop> in <step> number of steps.
@@ -105,7 +169,7 @@ def get_layers_geometric(start: int, stop: int, step: int) -> list[int]:
     return layers
 
 
-################################################################################
+########################################################################################################################
 def mlp(channels: list[int], do_bn=True):
     """
     simple Multi-layer perceptron, from SuperGlue/Magic Leap
@@ -123,7 +187,7 @@ def mlp(channels: list[int], do_bn=True):
     return torch.nn.Sequential(*layers)
 
 
-################################################################################
+########################################################################################################################
 def arange_like(x, dim: int):
     """
     from SuperGlue/Magic Leap
@@ -235,6 +299,50 @@ def weighted_transform(
     return r_mat, t_vec.view(-1, 3)
 
 
+def weighted_transform_single(
+        source: torch.Tensor,
+        target: torch.Tensor,
+        weight: torch.Tensor,
+        eps: torch.float64 = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    calculate a rigid transformation mapping source points to target points using weighted SVD
+    :param source: Nx3 points
+    :param target: Nx3 points
+    :param weight: N weights
+    :param eps: for numerical stability in divisions with potentially very small fractions
+    :returns R: 3x3 rotation matrix
+    :returns t: 3x translation vectors
+    """
+    # normalized weights. weights should be in the range [0, 1] (not checked)
+    # this should not harm, but makes mean calculations more simple
+    assert target.ndim == 2 and target.shape[1] == 3, "reference must be Nx3"
+    assert source.ndim == 2 and source.shape[1] == 3, "source must be Mx3"
+    assert weight.min() >= 0. and weight.max() <= 1.0, "weight must be in [0.0, 1.0]"
+
+    weight = weight.view(-1, 1)
+    weight_sum = weight.sum() + eps
+
+    source_mean = torch.sum(source * weight, dim=0, keepdim=True) / weight_sum
+    target_mean = torch.sum(target * weight, dim=0, keepdim=True) / weight_sum
+    source = source - source_mean
+    target = target - target_mean
+
+    covariance = torch.matmul(source.transpose(0, 1), target * weight).double()
+    # covariance = torch.einsum('md,mf->df', source, target * weight).double()
+
+    # 3x3 (DxD) matrix. do this in double precision
+    u, _, v = covariance.svd()
+    r_mat = torch.matmul(v, u.transpose(0, 1))
+    if torch.det(r_mat) < 0:
+        v[-1] *= -1.
+        r_mat = torch.matmul(v, u.transpose(0, 1))
+
+    t_vec = target_mean.double() - torch.matmul(source_mean.double(), r_mat.transpose(0, 1))
+
+    return r_mat.to(target), t_vec.squeeze().to(target)
+
+
 def estimate_transform(
         source: torch.Tensor,
         target: torch.Tensor,
@@ -242,17 +350,18 @@ def estimate_transform(
         eps: torch.float64 = 1e-10,
         dtype: torch.dtype = None,
         **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     given source and target points and predicted point correspondences, estimate rigid transformations between them
 
-    :param source: BxNx3 source point cloud
-    :param target: BxMx3 target point cloud
+    :param source: BxMx3 source point cloud
+    :param target: BxNx3 target point cloud
     :param prediction: dict: predictions as returned by scores_to_prediction(), torch.Tensor: score matrix BxNxM
     :param eps: for numerical stability in divisions with potentially very small fractions
     :param dtype: datatype for calculations. input tensors will be promoted this type
     :param kwargs: for compatibility with adaptive version
-    :returns: rotation matrices Bx3x3, translation vectors Bx3 with same type as source
+    :returns: rotation matrices Bx3x3, translation vectors Bx3 with same type as source,
+        source points rearranged to correspond to reference (for valid assignments prediction['matches1'] >= 0
     """
     device = source.device
     if dtype is None:
@@ -299,5 +408,35 @@ def estimate_transform(
     if old_type is not None:
         rotation = rotation.to(old_type)
         translation = translation.to(old_type)
+        source = source.to(old_type)
 
-    return rotation, translation
+    return rotation, translation, source
+
+
+def point_distance(
+        points_src: torch.Tensor,
+        points_ref: torch.Tensor,
+        r_mat: torch.Tensor,
+        t_vec: torch.Tensor,
+        valid: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    calculate point-wise squared distance
+
+    if valid is not None: mask invalid points with inf
+
+    :param points_src:  BxNxD source points
+    :param points_ref:  BxNxD reference points
+    :param r_mat:       Bx3x3 rotation matrices
+    :param t_vec:       Bx3 translation vectors
+    :param valid:       BxN validity index (bool)
+    :return:
+    """
+    points_src = points_src @ r_mat.transpose(1, 2) + t_vec.unsqueeze(1)
+    distance = points_src - points_ref
+    distance = torch.einsum('bnd,bnd->bn', distance, distance)
+
+    if valid is not None:
+        distance = torch.where(valid, distance, torch.tensor(torch.inf).to(distance))
+
+    return distance

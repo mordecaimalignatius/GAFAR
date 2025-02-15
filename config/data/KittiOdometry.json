@@ -1,0 +1,18 @@
+{
+  "dataset": {
+    "type": "kitti",
+    "sets": {
+      "train": {
+        "augment": {"use_augmentation": true}
+      }
+    },
+    "points": 1024,
+    "translation_good": 1.0,
+    "path": "set/me",
+    "meta": {
+      "train": "metadata/train.pkl",
+      "val": "metadata/val.pkl",
+      "test": "metadata/test.pkl"
+    }
+  }
+}

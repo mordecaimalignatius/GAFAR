@@ -244,7 +244,6 @@ class ModelNet40(Dataset):
             sample['points_src'][:, 3:6] = src_o3.normals
             sample['points_ref'][:, 3:6] = ref_o3.normals
 
-
         ret_dict = {'Ps': [torch.Tensor(x) for x in [sample['points_src'], sample['points_ref']]],
                     'ns': [torch.tensor(x) for x in [n1_gt, n2_gt]],
                     'es': [torch.tensor(x) for x in [e1_gt, e2_gt]],

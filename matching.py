@@ -17,19 +17,19 @@ import numpy as np
 import utils.sigint
 
 from copy import deepcopy
-from shutil import copyfile
 from time import time
 from logging import Logger, basicConfig
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 from typing import Union
+from collections import defaultdict
 
-from gafar import GAFAR, Loss
-from gafar.misc import scores_to_prediction, estimate_transform
+from gafar import GAFAR, GAFARv2, Loss
+from gafar.misc import scores_to_prediction, estimate_transform, point_distance
 from utils.metrics import transformation_error, evaluate_performance, chamfer_distance_modified
 
-from data import ModelNet40
+from data import DATASETS
 
 from utils.logs import get_logger, get_tensorboard_log_path
 from utils.logs import matching_results_to_tensorboard as log_tensorboard
@@ -39,15 +39,16 @@ from utils.misc import merge_dict, get_device
 from utils.random_state import worker_random_init, rng_save_restore
 
 
-################################################################################
+########################################################################################################################
 _default_config = {
     "matcher": {
-        "match_threshold": 0.5,
+        "match_threshold": 0.2,
     },
     "model": {
+        'type': 'GAFARv2',
     },
     "train": {
-        "epochs": 150,
+        "epochs": 300,
         "batch": 32,
         "learning_rate": 0.0001,
         "weight_decay": 1e-4,
@@ -58,45 +59,90 @@ _default_config = {
         "iteration": 1,                 # number of successive registration iterations
         "save_interval": 10,            # save model every N epochs
         "loaders": 8,                   # concurrent dataset threads
-        "early_stopping": 100,
+        "performance_metric": "valid",  # calculate performance metric on valid registration attempts
+        "early_stopping": 50,
     },
     "val": {
         "batch": 32,
         "sets": ["test"],
         "save": False,
-        "iteration": 2,
+        "iteration": 1,
         "loaders": 8,                   # concurrent dataset threads
     },
     'dataset': {
-        'num_points': 1024,
-        'sets': {
-            'train': {},
-        },
+        'type': 'modelnet40',
+        'save_factor': 0.95,            # save models with validation performance relative to current best
+        #  'sets': {
+        #     'train': {},
+        # },
         # "translation_good": 0.01,  # weight at which performance measure considers translation error to be 'good'
     },
 }
 
 
-################################################################################
-def performance(result: dict, score_loss: bool, legacy: bool = False,
+########################################################################################################################
+def performance(result: dict, score_loss: bool, metric: str = 'all',
                 rotation_good: float = 1.5, translation_good: float = 0.01) -> float:
     """ single performance score for matcher """
     weight_at_good = np.log(0.8)
     t_alpha = weight_at_good/translation_good
     r_alpha = weight_at_good/rotation_good
 
+    valid = metric == 'valid'
+
     if score_loss:
+        rotation_error_field = 'rotation_error_valid' if valid else 'rotation_error'
+        translation_error_field = 'translation_error_valid' if valid else 'translation_error'
         # product of precision, recall, 1 - rotation_error / sensitivity, 1 - translation_error / sensitivity
-        score = np.exp(r_alpha * result['rotation_error'][-1]) * \
-                np.exp(t_alpha * result['translation_error'][-1])
-        if legacy:
-            score *= result['precision_match'][-1] * result['recall_match'][-1]
+        score = np.exp(r_alpha * result[rotation_error_field][-1]) * \
+            np.exp(t_alpha * result[translation_error_field][-1])
+
+        if valid:
+            score *= (result['valid'][-1] / result['count'][-1])
 
     else:
         score = np.exp(r_alpha * result['rotation_error_nn'][-1]) * \
                 np.exp(t_alpha * result['translation_error_nn'][-1])
 
-    return score
+    return 0.0 if np.isnan(score) else score
+
+
+########################################################################################################################
+def scale_result(result: dict, score_loss: bool) -> dict:
+    result['correspondences'] /= result['count']
+    result['precision'] /= result['count']
+    result['recall'] /= result['count']
+    result['rotation_error'] = result['rotation_error'] / result['count'] / np.pi * 180.
+    result['translation_error'] /= result['count']
+    result['rotation_error_nn'] = result['rotation_error_nn'] / result['count'] / np.pi * 180.
+    result['translation_error_nn'] /= result['count']
+    result['registration_recall'] /= result['count']
+    result['registration_recall_nn'] /= result['count']
+    if score_loss:
+        result['inlier_ratio'] /= result['not_failed'].clip(min=1.0)
+        not_valid = result['valid'] == 0.0
+        if np.any(not_valid):
+            result['rotation_error_valid'][not_valid] = np.nan
+            result['translation_error_valid'][not_valid] = np.nan
+            result['chamfer_distance_valid'][not_valid] = np.nan
+            result['inlier_ratio_valid'][not_valid] = np.nan
+            result['registration_recall_valid'][not_valid] = np.nan
+        valid = np.logical_not(not_valid)
+        result['rotation_error_valid'][valid] = \
+            result['rotation_error_valid'][valid] / result['valid'][valid] / np.pi * 180.
+        result['translation_error_valid'][valid] /= result['valid'][valid]
+        result['chamfer_distance_valid'][valid] /= result['valid'][valid]
+        result['inlier_ratio_valid'][valid] /= result['valid'][valid]
+        result['registration_recall_valid'][valid] /= result['valid'][valid]
+        result['wrong_score_avg'] /= result['count_wrong'].clip(min=1.0)
+    result['precision_match'] /= result['count']
+    result['recall_match'] /= result['count']
+    result['matches_predicted'] /= result['count']
+    result['matches_predicted_threshold'] /= result['count']
+    result['chamfer_distance'] /= result['count']
+    result['chamfer_distance_nn'] /= result['count']
+
+    return result
 
 
 ################################################################################
@@ -133,10 +179,14 @@ def train(
         with open(run_config_path, 'r') as f:
             config = json.load(f)
 
-        model_path = opts.output / 'weights' / 'last.pt'
+        if opts.model is not None and opts.model.suffix == '.pt':
+            model_path = opts.model
+        else:
+            model_path = opts.output / 'weights' / 'last.pt'
         logger.info(f'loading state from {model_path}')
         ckpt = torch.load(model_path)
-        model = GAFAR(config['model'])
+        model = GAFARv2 if 'type' in config['model'] and config['model']['type'].lower() == 'gafarv2' else GAFAR
+        model = model(config['model'])
         model.load_state_dict(ckpt['model'].state_dict())
 
         # random generator seeds
@@ -154,17 +204,24 @@ def train(
         best_performance = ckpt['stats']['performance']
 
     else:
-        # check for normals in dataset, adjust model config accordingly
-        if 'normals' in config['dataset']:
-            config['model']['normals'] = config['dataset']['normals']
-
         # get model
-        if opts.model:
-            initial_path = Path(opts.model)
-            logger.info(f'loading initial state and model config from \"{initial_path}\"')
-            state = torch.load(initial_path)
-            model = GAFAR(state['model'].config)
-            model.load_state_dict(state['model'].state_dict())
+        if opts.model is not None and opts.model.suffix == '.pt':
+            logger.info(f'loading initial state and model config from \"{opts.model}\"')
+
+            state = torch.load(opts.model)
+            if hasattr(state['model'], 'config'):
+                model_config = state['model'].config
+            elif 'config' in state:
+                model_config = state['config']
+            else:
+                model_config = config['model']
+            model = GAFARv2 if 'type' in model_config and model_config['type'].lower() == 'gafarv2' else GAFAR
+            model = model(model_config)
+            if hasattr(state['model'], 'state_dict'):
+                model.load_state_dict(state['model'].state_dict())
+            else:
+                model.load_state_dict(state['model'])
+
             if not opts.renew_random_state and 'rng' in state:
                 logger.info('setting random state from initial state')
                 rng_save_restore(state['rng'])
@@ -172,15 +229,29 @@ def train(
                 logger.info(f'setting random state to {opts.seed}')
                 rng_save_restore(opts.seed)
         else:
-            model = GAFAR(config['model'])
+            model = GAFARv2 if 'type' in config['model'] and config['model']['type'].lower() == 'gafarv2' else GAFAR
+            model = model(config['model'])
             # seed random number generators
             if opts.manual_seed:
                 logger.info(f'setting random state to {opts.seed}')
                 rng_save_restore(opts.seed)
 
+        # update radius neighbourhood to dataset
+        if 'neighbourhood_radius' in config['matcher']:
+            logger.info(f'updating neighbourhood search radius to {config["matcher"]["neighbourhood_radius"]:.3f}'
+                        f' (from matcher config)')
+            model.update_radius(config['matcher']['neighbourhood_radius'])
+        elif 'neighbourhood_radius' in config['dataset']:
+            logger.info(f'updating neighbourhood search radius to {config["dataset"]["neighbourhood_radius"]:.3f}'
+                        f' (from dataset config)')
+            model.update_radius(config['dataset']['neighbourhood_radius'])
+
         # return full set of model parameters (i.e. with defaults) back to experiment config
         config['model'] = model.config
-        logger.info(f'training model with point normals: {"YES" if config["model"]["normals"] else "NO"}')
+        # check for normals in dataset, adjust model config accordingly
+        if 'normals' in config['model']:
+            config['dataset']['normals'] = config['model']['normals']
+            logger.info(f'training model with point normals: {"YES" if config["model"]["normals"] else "NO"}')
 
         epoch = 0
         best_epoch = -1
@@ -191,7 +262,15 @@ def train(
         best_translation = np.inf
         best_performance = 0.
 
+    if 'type' in config['model']:
+        logger.info(f'training model of type \"{config["model"]["type"]}\"')
     logger.info(f'batch size: {config["train"]["batch"]}')
+    if opts.epoch is not None:
+        logger.info(f'overriding number of epochs from command line: {opts.epoch:d}')
+        config['train']['epochs'] = opts.epoch
+
+    logger.info(f'Matcher: confidence threshold: {config["matcher"]["match_threshold"]}')
+    logger.info(f'Matcher: minimum number of matches: {config["matcher"]["min_matches"]}')
 
     # gpu choice/torch device
     device = get_device(opts.device, opts.gpu)
@@ -226,8 +305,9 @@ def train(
         torch.save(ckpt, initial_path)
 
     # loading dataset
+    logger.info(f'loading dataset of type <{config["dataset"]["type"]}>')
     num_loaders = config['train']['loaders']
-    training_set = ModelNet40(config['dataset'], 'train')
+    training_set = DATASETS[config['dataset']['type']](config['dataset'], 'train')
     training_loader = DataLoader(
         training_set,
         num_workers=num_loaders,
@@ -236,16 +316,14 @@ def train(
         shuffle=True,
         drop_last=True,
         worker_init_fn=worker_random_init,
+        pin_memory=True,
+        persistent_workers=config['train']['persistent_workers'] if 'persistent_workers' in config['train'] else False,
     )
-    # check if validation set is a portion of the training set
-    training_items = getattr(training_set, 'items', None) if 'shard' in config['dataset']['sets']['train'] else None
 
     validation_loader = DataLoader(
-        ModelNet40(
+        DATASETS[config['dataset']['type']](
             config['dataset'],
             'val',
-            samples=training_items,
-            samples_complement=True,
         ),
         num_workers=num_loaders,
         prefetch_factor=max(config['train']['batch'] // num_loaders, 2),
@@ -253,6 +331,7 @@ def train(
         shuffle=False,
         drop_last=False,
         worker_init_fn=worker_random_init,
+        pin_memory=True,
     )
 
     # return full dataset config to experiment config
@@ -291,50 +370,35 @@ def train(
     if config['train']['iteration'] > 1:
         logger.info(f'model training with <{config["train"]["iteration"]}> alignment iterations')
 
+    rr = {
+        'r': config['dataset']['registration_recall']['rotation'] / 180.0 * np.pi,
+        't': config['dataset']['registration_recall']['translation'],
+    } if 'registration_recall' in config['dataset'] else None
+
     #
     # TRAINING
     #
     logger.info('starting model training...')
     iteration = max(1, config['train']['iteration'])
+    min_matches = config['matcher']['min_matches']
     for epoch in range(epoch, config['train']['epochs']):
         train_start_time = time()
 
-        result = {
-            'loss': np.zeros((iteration,)),
-            'score_loss': np.zeros((iteration,)),
-            'rotation_loss': np.zeros((iteration,)),
-            'translation_loss': np.zeros((iteration,)),
-            'precision': np.zeros((iteration,)),
-            'recall': np.zeros((iteration,)),
-            'precision_match': np.zeros((iteration,)),
-            'recall_match': np.zeros((iteration,)),
-            'correspondences': np.zeros((iteration,)),
-            'matches_predicted': np.zeros((iteration,)),
-            'matches_predicted_threshold': np.zeros((iteration,)),
-            'rotation_error': np.zeros((iteration,)),
-            'translation_error': np.zeros((iteration,)),
-            'rotation_error_valid': np.zeros((iteration,)),
-            'translation_error_valid': np.zeros((iteration,)),
-            'rotation_error_nn': np.zeros((iteration,)),
-            'translation_error_nn': np.zeros((iteration,)),
-            'chamfer_distance': np.zeros((iteration,)),
-            'chamfer_distance_valid': np.zeros((iteration,)),
-            'chamfer_distance_nn': np.zeros((iteration,)),
-            'wrong_score_max': np.zeros((iteration,)),
-            'wrong_score_min': np.ones((iteration,)),
-            'wrong_score_avg': np.zeros((iteration,)),
-            'dust_bin_score': np.zeros((iteration,)),
-            'time': np.zeros((iteration,)),
-            'time_batch': np.zeros((iteration,)),
-            'time_train': 0.0,
-            'count': np.zeros((iteration,)),
-            'valid': np.zeros((iteration,)),
-        }
+        result = defaultdict(lambda: np.zeros((iteration,)))
         count_wrong = np.zeros((iteration,))
+        not_failed = np.zeros((iteration,))  # number of examples without correspondence predictions
 
         model.train()
-        for source_points, target_points, correspondences, gt_rotation, gt_translation, _, _, gt_clean in \
-                training_loader:
+        criterion.train()
+
+        for data in training_loader:
+            source_points = data['points_src']
+            target_points = data['points_ref']
+            gt_rotation = data['rotation']
+            gt_translation = data['translation']
+            gt_clean = data['points_clean']
+            correspondences = data['correspondence']
+
             batch_size = source_points.shape[0]
             source_points_c = source_points.to(device)
             target_points_c = target_points.to(device)
@@ -342,7 +406,6 @@ def train(
             gt_translation_c = gt_translation.double().to(device)
             rotation_estimate = torch.eye(3, dtype=torch.double, device=device).unsqueeze(0).expand(batch_size, -1, -1)
             translation_estimate = torch.zeros_like(gt_translation_c)
-
             ppm_valid = torch.ones((batch_size,), dtype=torch.bool, device=device)
 
             for idx in range(iteration):
@@ -350,15 +413,12 @@ def train(
                 optimizer.zero_grad()
 
                 scores = model(source_points_c, target_points_c)
-                scores = scores['scores']
-                losses = criterion(
-                    scores,
-                    source_points_c[:, :, :3],
-                    target_points_c[:, :, :3],
-                    correspondence=correspondences.long().to(device),
-                    rotation=gt_rotation_c,
-                    translation=gt_translation_c,
-                )
+                scores['points_0'] = source_points_c[..., :3]
+                scores['points_1'] = target_points_c[..., :3]
+                scores['correspondence'] = correspondences.long().to(device)
+                scores['rotation'] = gt_rotation_c
+                scores['translation'] = gt_translation_c
+                losses = criterion(scores)
                 loss = losses['loss']
 
                 result['loss'][idx] += loss.item()
@@ -378,6 +438,10 @@ def train(
                     gt_rotation_c,
                     gt_translation_c,
                 )
+                if rr is not None:
+                    result['registration_recall_nn'][idx] += torch.logical_and(
+                        torch.lt(rotation_error_nn_batch, rr['r']),
+                        torch.lt(translation_error_nn_batch, rr['t'])).sum().item()
 
                 result['chamfer_distance_nn'][idx] += chamfer_distance_modified(
                     (source_points_c[:, :, :3].double().matmul(losses['rotation'].transpose(1, 2)) +
@@ -388,10 +452,11 @@ def train(
                 ).sum().item()
 
                 if criterion.has_score_loss:
-                    prediction = scores_to_prediction(scores.detach(), config['matcher']['match_threshold'])
+                    prediction = scores_to_prediction(scores['score'].detach(), config['matcher']['match_threshold'],
+                                                      discard_bin=config['matcher']['exclude_bin'])
 
                     # non-training relevant performance metrics
-                    rotation_estimate, translation_estimate = estimate_transform(
+                    rotation_estimate, translation_estimate, source_match_trgt = estimate_transform(
                         source_points_c[:, :, :3].double(),
                         target_points_c[:, :, :3].double(),
                         # predictions,
@@ -409,7 +474,8 @@ def train(
                     )
 
                     # transformations based on PPMs only valid for >= 3 point matches
-                    ppm_valid = (prediction['matches1'] >= 0).sum(1) > 2
+                    ppm_valid = torch.ge(
+                        (prediction['matches1'] >= 0).sum(1), min_matches).to(rotation_error_batch.device)
                     result['valid'][idx] += ppm_valid.sum().item()
 
                     overall, matched, wrong_scores = evaluate_performance(prediction, correspondences)
@@ -427,6 +493,22 @@ def train(
                     count_wrong[idx] += wrong_scores['num_wrong']
                     result['matches_predicted'][idx] += (prediction['matches0_all'] >= 0).sum().item()
                     result['matches_predicted_threshold'][idx] += (prediction['matches0'] >= 0).sum().item()
+
+                    distance = point_distance(source_match_trgt, target_points_c[..., :3].double(),
+                                              gt_rotation_c.double(), gt_translation_c.double(),
+                                              (prediction['matches1'] >= 0).to(device))
+                    inlier_sum = (distance < config['dataset']['correspondence']['distance']).sum(1)
+                    matches_sum = (prediction['matches1'] >= 0.0).sum(1)
+                    c_sum_valid = matches_sum > 0
+                    not_failed[idx] += c_sum_valid.sum().item()
+                    inlier_ratio = inlier_sum / matches_sum
+                    result['inlier_ratio'][idx] += inlier_ratio[c_sum_valid].sum().item()
+                    result['inlier_ratio_valid'][idx] += inlier_ratio[ppm_valid].sum().item()
+
+                    if rr is not None:
+                        recall = torch.logical_and(rotation_error_batch < rr['r'], translation_error_batch < rr['t'])
+                        result['registration_recall'][idx] += recall.sum().item()
+                        result['registration_recall_valid'][idx] += recall[ppm_valid].sum().item()
 
                 if not criterion.is_score_loss:
                     rotation_estimate = losses['rotation']
@@ -448,7 +530,7 @@ def train(
                 result['translation_error_nn'][idx] += translation_error_nn_batch.sum().item()
                 if hasattr(model, 'bin_score'):
                     result['dust_bin_score'][idx] += model.bin_score.item() * batch_size
-                result['correspondences'][idx] += np.sum(correspondences.cpu().detach().numpy() >= 0).astype(np.double)
+                result['correspondences'][idx] += (correspondences >= 0.0).sum().item()
                 result['count'][idx] += batch_size
 
                 # update source point cloud, gt_rotation, gt_translation and resulting transformation
@@ -465,7 +547,8 @@ def train(
 
                 result['time_batch'][idx] += time() - start_time
 
-        result['dust_bin_score'] /= result['count']
+        if hasattr(model, 'bin_score'):
+            result['dust_bin_score'] /= result['count']
         result['correspondences'] /= result['count']
         result['recall'] /= result['count']
         result['precision'] /= result['count']
@@ -473,19 +556,36 @@ def train(
         result['translation_error'] /= result['count']
         result['rotation_error_nn'] = result['rotation_error_nn'] / result['count'] / np.pi * 180.
         result['translation_error_nn'] /= result['count']
+        result['registration_recall'] /= result['count']
+        result['registration_recall_nn'] /= result['count']
         if criterion.has_score_loss:
-            result['valid'][result['valid'] == 0.0] = 1.0
-            result['rotation_error_valid'] = result['rotation_error_valid'] / result['valid'] / np.pi * 180.
-            result['translation_error_valid'] /= result['valid']
-            result['chamfer_distance_valid'] /= result['valid']
-            count_wrong[count_wrong == 0.0] = 1.0
-            result['wrong_score_avg'] /= count_wrong
+            result['inlier_ratio'] /= not_failed.clip(min=1.0)
+            not_valid = result['valid'] == 0.0
+            if np.any(not_valid):
+                result['rotation_error_valid'][not_valid] = np.nan
+                result['translation_error_valid'][not_valid] = np.nan
+                result['chamfer_distance_valid'][not_valid] = np.nan
+                result['inlier_ratio_valid'][not_valid] = np.nan
+                result['registration_recall_valid'][not_valid] = np.nan
+            valid = np.logical_not(not_valid)
+            result['rotation_error_valid'][valid] = \
+                result['rotation_error_valid'][valid] / result['valid'][valid] / np.pi * 180.
+            result['translation_error_valid'][valid] /= result['valid'][valid]
+            result['chamfer_distance_valid'][valid] /= result['valid'][valid]
+            result['inlier_ratio_valid'][valid] /= result['valid'][valid]
+            result['registration_recall_valid'][valid] /= result['valid'][valid]
+            result['wrong_score_avg'] /= count_wrong.clip(min=1.0)
         result['precision_match'] /= result['count']
         result['recall_match'] /= result['count']
         result['matches_predicted'] /= result['count']
         result['matches_predicted_threshold'] /= result['count']
         result['chamfer_distance'] /= result['count']
         result['chamfer_distance_nn'] /= result['count']
+
+        if rr is None:
+            del result['registration_recall']
+            del result['registration_recall_valid']
+            del result['registration_recall_nn']
 
         result['time_train'] = time() - train_start_time
 
@@ -496,6 +596,7 @@ def train(
         log_console(result, logger, criterion=criterion, prepend='\t', mode='train')
 
         model.eval()
+        criterion.eval()
         result = val(
             config, model,
             opts=opts,
@@ -503,6 +604,7 @@ def train(
             criterion=criterion,
             data_loader=validation_loader,
             logger=logger,
+            rr=rr,
         )
 
         # write results to tensorboard
@@ -510,7 +612,7 @@ def train(
 
         # check model performance
         score_loss = getattr(criterion, 'is_score_loss', False)
-        epoch_performance = performance(result, score_loss,
+        epoch_performance = performance(result, score_loss, metric=config['train']['performance_metric'],
                                         translation_good=config['dataset']['translation_good'])
         if epoch_performance > best_performance:
             best_epoch = epoch
@@ -539,9 +641,10 @@ def train(
 
         torch.save(ckpt, opts.output / 'weights' / 'last.pt')
 
-        if config['train']['save_interval'] > 0 and (epoch % config['train']['save_interval'] == 0):
+        if (config['train']['save_interval'] > 0 and (epoch % config['train']['save_interval'] == 0)) \
+                or epoch_performance > config['dataset']['save_factor'] * best_performance:
             # save current model
-            model_path = opts.output / 'weights' / f'epoch_{epoch:d}.pt'
+            model_path = opts.output / 'weights' / f'epoch_{epoch:d}_{int(epoch_performance * 1000):04d}.pt'
             torch.save(ckpt, model_path)
 
         if epoch == best_epoch:
@@ -562,7 +665,7 @@ def train(
             break
 
     # copy best model to main experiment directory
-    if best_epoch > 0:
+    if best_epoch > -1:
         if getattr(criterion, "is_score_loss", False):
             logger.info(f'best model with performance {best_performance:.3f}, '
                         f'and validation metrics: recall {best_recall:.3f}, precision {best_precision:.3f} ' +
@@ -571,16 +674,22 @@ def train(
         else:
             logger.info(f'best model with performance {best_performance:.3f},'
                         f'validation residual rotation error {best_rotation:.3f} and translation ' +
-                        f'error {best_translation:.3f} in epoch {best_epoch:03d} (loss {best_loss:.6f})')
-
-        copyfile(opts.output / 'weights' / 'best.pt', (opts.output / getattr(opts, "name", "model")).with_suffix(".pt"))
-        write_json(
-            (opts.output / getattr(opts, "name", "model")).with_suffix(".json"),
-            {'matcher': config['matcher'], 'model': config['model']})
+                        f'error {best_translation:.3f} in epoch {best_epoch:03d} (loss {best_loss:.2f})')
 
         # load best model
-        ckpt = torch.load((opts.output / getattr(opts, "name", "model")).with_suffix(".pt"))
+        ckpt = torch.load((opts.output / 'weights' / 'best.pt'))
         model.load_state_dict(ckpt['model'].state_dict())
+
+        # strip model and save
+        ckpt = {
+            'model': model.state_dict(),
+            'config': model.config,
+        }
+        torch.save(ckpt, (opts.output / getattr(opts, 'name', 'model')).with_suffix('.pt'))
+        write_json(
+            (opts.output / getattr(opts, 'name', 'model')).with_suffix('.json'),
+            {'matcher': config['matcher'], 'model': config['model']})
+
         result = val(
             config,
             model,
@@ -588,9 +697,12 @@ def train(
             device=device,
             criterion=criterion,
             data_loader=validation_loader,
+            logger=logger,
+            rr=rr,
         )
 
         epoch_performance = performance(result, getattr(criterion, 'is_score_loss', False),
+                                        metric=config['train']['performance_metric'],
                                         translation_good=config['dataset']['translation_good'])
         logger.info(f'Val   {best_epoch:03d}:  ({epoch_performance:.5f})')
         log_console(result, logger, criterion=criterion)
@@ -607,6 +719,7 @@ def val(
         device: torch.device = None,
         criterion: torch.nn.Module = None,
         data_loader: torch.utils.data.DataLoader = None,
+        rr: dict = None,
         logger: Logger = None,
 ) -> dict:
     """
@@ -618,6 +731,7 @@ def val(
     :param device:
     :param criterion: loss function
     :param data_loader:
+    :param rr: limits for registration recall ['r', 't']
     :param logger:
     :return:
     """
@@ -633,24 +747,45 @@ def val(
         # load model
         logger.info(f'loading model state from {model}')
         ckpt = torch.load(model)
+
         if hasattr(ckpt['model'], 'config'):
-            model = GAFAR(ckpt['model'].config)
+            model_config = ckpt['model'].config
+        elif 'config' in ckpt:
+            model_config = ckpt['config']
+        else:
+            model_config = config['model']
+        model = GAFARv2 if 'type' in model_config and model_config['type'].lower() == 'gafarv2' else GAFAR
+        model = model(model_config)
+        if hasattr(ckpt['model'], 'state_dict'):
             model.load_state_dict(ckpt['model'].state_dict())
         else:
-            model = GAFAR(ckpt['config'])
             model.load_state_dict(ckpt['model'])
-
+        if 'neighbourhood_radius' in config['matcher']:
+            logger.info(f'updating neighbourhood search radius to {config["matcher"]["neighbourhood_radius"]:.3f}')
+            model.update_radius(config['matcher']['neighbourhood_radius'])
         config['model'] = model.config
 
+        logger.info(f'testing model of type \"{config["model"]["type"]}\"')
         logger.info(f'feature dimension <{config["model"]["feature_dimension"]}>, '
                     f'matching attention <{config["model"]["matcher"]["attention"]}>'
                     )
+
+        # update radius neighbourhood to dataset
+        if 'neighbourhood_radius' in config['matcher']:
+            logger.info(f'updating neighbourhood search radius to {config["matcher"]["neighbourhood_radius"]:.3f}'
+                        f' (from matcher config)')
+            model.update_radius(config['matcher']['neighbourhood_radius'])
+        elif 'neighbourhood_radius' in config['dataset']:
+            logger.info(f'updating neighbourhood search radius to {config["dataset"]["neighbourhood_radius"]:.3f}'
+                        f' (from dataset config)')
+            model.update_radius(config['dataset']['neighbourhood_radius'])
 
         device = get_device(opts.device, opts.gpu)
         model.to(device)
 
         logger.info(f'batch size: {config["val"]["batch"]}')
         logger.info(f'match threshold: {config["matcher"]["match_threshold"]}')
+        logger.info(f'minimum number of matches: {config["matcher"]["min_matches"]}')
 
         # seed torch random number generator
         if opts and opts.manual_seed:
@@ -663,11 +798,12 @@ def val(
 
         # get default loss
         if not criterion:
-            criterion = Loss()
+            criterion = Loss(**(config['val']['loss'] if 'loss' in config['val'] else {}))
             criterion.to(device)
 
     data = [data_loader] if data_loader else config['val']['sets']
     result = None   # so the linter does not complain
+    min_matches = config['matcher']['min_matches']
     for partition in data:
         # load data set/partition
         if not isinstance(partition, DataLoader):
@@ -677,7 +813,7 @@ def val(
                 config['dataset']['normals'] = config['model']['normals']
 
             data_loader = DataLoader(
-                ModelNet40(config['dataset'], partition),
+                DATASETS[config['dataset']['type']](config['dataset'], partition),
                 num_workers=config['val']['loaders'],
                 prefetch_factor=max(config['val']['batch'] // config['val']['loaders'], 2),
                 batch_size=config['val']['batch'],
@@ -686,40 +822,26 @@ def val(
                 worker_init_fn=worker_random_init,
             )
 
+            rr = None
+            if 'registration_recall' in config['dataset']:
+                rr = {'r': config['dataset']['registration_recall']['rotation'] / 180.0 * np.pi,
+                      't': config['dataset']['registration_recall']['translation']}
+
         iteration = max(1, config['val']['iteration'])
-        result = {
-            'loss': np.zeros((iteration,)),
-            'score_loss': np.zeros((iteration,)),
-            'rotation_loss': np.zeros((iteration,)),
-            'translation_loss': np.zeros((iteration,)),
-            'precision': np.zeros((iteration,)),
-            'recall': np.zeros((iteration,)),
-            'precision_match': np.zeros((iteration,)),
-            'recall_match': np.zeros((iteration,)),
-            'correspondences': np.zeros((iteration,)),
-            'matches_predicted': np.zeros((iteration,)),
-            'matches_predicted_threshold': np.zeros((iteration,)),
-            'rotation_error': np.zeros((iteration,)),
-            'translation_error': np.zeros((iteration,)),
-            'rotation_error_valid': np.zeros((iteration,)),
-            'translation_error_valid': np.zeros((iteration,)),
-            'rotation_error_nn': np.zeros((iteration,)),
-            'translation_error_nn': np.zeros((iteration,)),
-            'chamfer_distance': np.zeros((iteration,)),
-            'chamfer_distance_nn': np.zeros((iteration,)),
-            'chamfer_distance_valid': np.zeros((iteration,)),
-            'wrong_score_max': np.zeros((iteration,)),
-            'wrong_score_min': np.ones((iteration,)),
-            'wrong_score_avg': np.zeros((iteration,)),
-            'dust_bin_score': np.zeros((iteration,)),
-            'count': np.zeros((iteration,)),
-            'valid': np.zeros((iteration,)),
-        }
+        result = defaultdict(lambda: np.zeros((iteration,)))
         count_wrong = np.zeros((iteration,))
+        not_failed = np.zeros((iteration,))  # number of examples without correspondence predictions
 
         # evaluation loop
         model.eval()
-        for source_points, target_points, correspondences, gt_rotation, gt_translation, _, _, gt_clean in data_loader:
+        criterion.eval()
+        for data in data_loader:
+            source_points = data['points_src']
+            target_points = data['points_ref']
+            correspondences = data['correspondence']
+            gt_rotation = data['rotation']
+            gt_translation = data['translation']
+            gt_clean = data['points_clean']
             batch_size = source_points.shape[0]
             source_points_c = source_points.to(device=device)
             target_points_c = target_points.to(device=device)
@@ -738,15 +860,12 @@ def val(
             # registration iteration
             for idx in range(iteration):
                 scores = model(source_points_c, target_points_c)
-                scores = scores['scores']
-                losses = criterion(
-                    scores,
-                    source_points_c[:, :, :3],
-                    target_points_c[:, :, :3],
-                    correspondence=correspondences.long().to(device),
-                    rotation=gt_rotation_c,
-                    translation=gt_translation_c,
-                )
+                scores['points_0'] = source_points_c[..., :3]
+                scores['points_1'] = target_points_c[..., :3]
+                scores['correspondence'] = correspondences.long().to(device)
+                scores['rotation'] = gt_rotation_c
+                scores['translation'] = gt_translation_c
+                losses = criterion(scores)
                 loss = losses['loss']
 
                 result['loss'][idx] += loss.item()
@@ -760,6 +879,9 @@ def val(
                     gt_rotation_c,
                     gt_translation_c,
                 )
+                if rr is not None:
+                    result['registration_recall_nn'][idx] += torch.logical_and(
+                        rotation_error_nn_batch < rr['r'], translation_error_nn_batch < rr['t']).sum().item()
 
                 chamfer_batch = chamfer_distance_modified(
                     (source_points_c[:, :, :3].double().matmul(losses['rotation'].transpose(1, 2)) +
@@ -771,21 +893,19 @@ def val(
                 result['chamfer_distance_nn'][idx] += chamfer_batch
 
                 if criterion.has_score_loss:
-                    prediction = scores_to_prediction(scores.detach(), config['matcher']['match_threshold'])
+                    prediction = scores_to_prediction(scores['score'].detach(),
+                                                      config['matcher']['match_threshold'],
+                                                      discard_bin=config['matcher']['exclude_bin'])
 
-                    rotation_estimate, translation_estimate = estimate_transform(
-                        source_points_c[:, :, :3],
-                        target_points_c[:, :, :3],
+                    rotation_estimate, translation_estimate, source_match_trgt = estimate_transform(
+                        source_points_c[:, :, :3].double(),
+                        target_points_c[:, :, :3].double(),
                         # predictions,
                         {
                             'matches1': prediction['matches1'].to(device),
-                            'matching_scores1': prediction['matching_scores1'].to(device),
+                            'matching_scores1': prediction['matching_scores1'].double().to(device),
                         },
                     )
-
-                    # transformations based on PPMs only valid for >= 3 point matches
-                    ppm_valid = (prediction['matches1'] >= 0).sum(1) > 2
-                    n_valid_batch = ppm_valid.sum().item()
 
                     rotation_error_batch, translation_error_batch = transformation_error(
                         rotation_estimate.double(),
@@ -793,6 +913,11 @@ def val(
                         gt_rotation_c,
                         gt_translation_c,
                     )
+
+                    # transformations based on PPMs only valid for >= 3 point matches
+                    ppm_valid = torch.ge(
+                        (prediction['matches1'] >= 0).sum(1), min_matches).to(rotation_error_batch.device)
+                    n_valid_batch = ppm_valid.sum().item()
 
                     overall, matched, wrong_scores = evaluate_performance(prediction, correspondences)
                     result['wrong_score_max'][idx] = max(wrong_scores['max'], result['wrong_score_max'][idx])
@@ -811,6 +936,22 @@ def val(
                     result['valid'][idx] += n_valid_batch
                     count_wrong[idx] += wrong_scores['num_wrong']
 
+                    distance = point_distance(source_match_trgt, target_points_c[..., :3].double(),
+                                              gt_rotation_c.double(), gt_translation_c.double(),
+                                              (prediction['matches1'] >= 0).to(device))
+                    inlier_sum = (distance < config['dataset']['correspondence']['distance']).sum(1)
+                    matches_sum = (prediction['matches1'] >= 0.0).sum(1)
+                    c_sum_valid = matches_sum > 0
+                    not_failed[idx] += c_sum_valid.sum().item()
+                    inlier_ratio = inlier_sum / matches_sum
+                    result['inlier_ratio'][idx] += inlier_ratio[c_sum_valid].sum().item()
+                    result['inlier_ratio_valid'][idx] += inlier_ratio[ppm_valid].sum().item()
+
+                    if rr is not None:
+                        recall = torch.logical_and(rotation_error_batch < rr['r'], translation_error_batch < rr['t'])
+                        result['registration_recall'][idx] += recall.sum().item()
+                        result['registration_recall_valid'][idx] += recall[ppm_valid].sum().item()
+
                 if not criterion.is_score_loss:
                     rotation_estimate = losses['rotation']
                     translation_estimate = losses['translation']
@@ -828,7 +969,7 @@ def val(
                     result['chamfer_distance_valid'][idx] += chamfer_batch[ppm_valid].sum().item()
 
                 # non batch normalized average accuracy
-                result['correspondences'][idx] += (correspondences.cpu().detach().numpy() >= 0).sum().item()
+                result['correspondences'][idx] += (correspondences >= 0).sum().item()
                 result['rotation_error_nn'][idx] += rotation_error_nn_batch.sum().item()
                 result['translation_error_nn'][idx] += translation_error_nn_batch.sum().item()
                 result['count'][idx] += batch_size
@@ -856,20 +997,36 @@ def val(
         result['translation_error'] /= result['count']
         result['rotation_error_nn'] = result['rotation_error_nn'] / result['count'] / np.pi * 180.
         result['translation_error_nn'] /= result['count']
+        result['registration_recall'] /= result['count']
+        result['registration_recall_nn'] /= result['count']
         if criterion.has_score_loss:
-            result['valid'][result['valid'] == 0.0] = 1.0
-            result['rotation_error_valid'] = result['rotation_error_valid'] / result['valid'] / np.pi * 180.
-            result['translation_error_valid'] /= result['valid']
-            result['chamfer_distance_valid'] /= result['valid']
-            count_wrong[count_wrong == 0.] = 1.0
-            result['wrong_score_avg'] /= count_wrong
-
+            result['inlier_ratio'] /= not_failed.clip(min=1.0)
+            not_valid = result['valid'] == 0.0
+            if np.any(not_valid):
+                result['rotation_error_valid'][not_valid] = np.nan
+                result['translation_error_valid'][not_valid] = np.nan
+                result['chamfer_distance_valid'][not_valid] = np.nan
+                result['inlier_ratio_valid'][not_valid] = np.nan
+                result['registration_recall_valid'][not_valid] = np.nan
+            valid = np.logical_not(not_valid)
+            result['rotation_error_valid'][valid] = \
+                result['rotation_error_valid'][valid] / result['valid'][valid] / np.pi * 180.
+            result['translation_error_valid'][valid] /= result['valid'][valid]
+            result['chamfer_distance_valid'][valid] /= result['valid'][valid]
+            result['inlier_ratio_valid'][valid] /= result['valid'][valid]
+            result['registration_recall_valid'][valid] /= result['valid'][valid]
+            result['wrong_score_avg'] /= count_wrong.clip(min=1.0)
         result['precision_match'] /= result['count']
         result['recall_match'] /= result['count']
         result['matches_predicted'] /= result['count']
         result['matches_predicted_threshold'] /= result['count']
         result['chamfer_distance'] /= result['count']
         result['chamfer_distance_nn'] /= result['count']
+
+        if rr is None:
+            del result['registration_recall']
+            del result['registration_recall_valid']
+            del result['registration_recall_nn']
 
         if not is_training:
             # write output
@@ -880,19 +1037,23 @@ def val(
 
 
 def get_args():
-    parser = argparse.ArgumentParser('train/test point cloud matching on small (ModelNet40 2048 point) point clouds')
-    parser.add_argument('config', metavar='config.json', help='config file')
-    parser.add_argument('output', metavar='output/path', help='output path for trained models, logs, etc.')
+    parser = argparse.ArgumentParser('train/test point cloud matching on small point clouds or subsets.')
+    parser.add_argument('config', metavar='config.json', type=Path, help='config file')
+    parser.add_argument('output', metavar='output/path', type=Path, help='output path for trained models, logs, etc.')
     parser.add_argument('--batch-size', type=int, default=None, help='Override batch size from command line.')
-    parser.add_argument('-d', '--dataset', default=None, type=str,
+    parser.add_argument('-d', '--dataset', default=None, type=Path,
                         help='dataset config file. Supersedes dataset in main config file.')
     parser.add_argument('--deterministic', action='store_true', help='Set CUDA to deterministic execution.')
     parser.add_argument('--device', type=str, choices=['cuda', 'gpu', 'cpu'], default='cuda',
                         help='train/evaluate on GPU or CPU.')
     parser.add_argument('--gpu', type=int, default=None, help='PyTorch GPU id to use if multiple GPUs in system.')
     parser.add_argument('--iteration', type=int, default=None, help='Override number of training/testing iterations.')
-    parser.add_argument('-m', '--model', default=None, type=str,
-                        help='Initialize model from pretrained weights or Resume this checkpoint/experiment.')
+    parser.add_argument('-m', '--model', default=None, type=Path,
+                        help='If configuration file (.json) load the model configuration from here '
+                             '(experiment config takes precedence).'
+                             'If trained model (.pt) initialize model from pretrained weights or '
+                             'resume this checkpoint/experiment.')
+    parser.add_argument('-e', '--epoch', type=int, default=None, help='Override training epochs.')
     parser.add_argument('-r', '--resume', action='store_true', help='Resume last training instead of starting new one.')
     parser.add_argument('-t', '--threshold', type=float, default=None, help='Override score threshold of matches.')
     parser.add_argument('-v', '--validate', action='store_true',
@@ -910,31 +1071,36 @@ def get_args():
 
 def main(opts: argparse.Namespace):
     """ run train/validation script """
-    opts.config = Path(opts.config)
-    if opts.model:
-        opts.model = Path(opts.model)
-    if opts.dataset:
-        opts.dataset = Path(opts.dataset)
+    with open(opts.config, 'r') as f:
+        config = merge_dict(_default_config, json.load(f))
+
     opts.output = get_tensorboard_log_path(Path(opts.output), resume=opts.resume)
     if not opts.output.exists():
         # catch if --resume flag is set in empty/new directory
         opts.output.mkdir(parents=True)
 
-    with open(opts.config, 'r') as f:
-        config = merge_dict(_default_config, json.load(f))
+    logger = get_logger(opts.output / 'run.log', 'INFO', colored=True)
+    logger.info(f'read config from {opts.config}')
+    logger.info(f'torch version: {torch.__version__}')
 
     # get dataset
     if opts.dataset:
-        with open(opts.dataset, 'r') as f:
-            if not opts.validate:   # training
-                config = merge_dict(json.load(f), config)
-            else:
-                config = merge_dict(config, json.load(f))
-
-    logger = get_logger(opts.output / 'run.log', 'INFO')
-    logger.info(f'read config from {opts.config}')
-    if opts.dataset:
         logger.info(f'using dataset {opts.dataset}')
+        with open(opts.dataset, 'r') as f:
+            data_config = json.load(f)
+        config['dataset'] = \
+            merge_dict(config['dataset'] if 'dataset' in config else {},
+                       data_config['dataset'] if 'dataset' in data_config else data_config)
+
+    # get model config
+    if opts.model is not None and opts.model.suffix == '.json':
+        logger.info(f'using model config {opts.model}')
+        with open(opts.model, 'r') as f:
+            model_config = json.load(f)
+        config['model'] = \
+            merge_dict(config['model'] if 'model' in config else {},
+                       model_config['model'] if 'model' in model_config else model_config)
+
     logger.info(f'resuming from {opts.output}' if opts.resume else f'saving new run to {opts.output}')
 
     # deterministic behaviour of cuda
@@ -962,7 +1128,7 @@ def main(opts: argparse.Namespace):
     if not opts.validate:
         # register handler for sigint to make training gracefully interruptable
         signal.signal(signal.SIGINT, utils.sigint.sigint_handler)
-        opts.name = opts.config.name
+        opts.name = opts.config.name if opts.config.name != 'config' else 'model'
 
         try:
             train(

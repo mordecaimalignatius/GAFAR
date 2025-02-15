@@ -11,7 +11,27 @@ import numpy as np
 from typing import Union
 
 
-################################################################################
+########################################################################################################################
+def remove_multiples(correspondences: np.ndarray, distances: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """ remove multiple values in correspondences. choose remaining values according to smallest distance """
+    unique, inverse, counts = np.unique(correspondences[valid], return_inverse=True, return_counts=True)
+
+    multiples = counts > 1
+    linear = np.nonzero(valid)[0]
+    distances = distances[valid]
+    # didn't come up with a better/more efficient solution
+    unique_pos = np.nonzero(multiples)[0]
+    for idx in unique_pos:
+        # value and position in correspondences/distances/valid
+        positions = inverse == idx
+        linear_idx = linear[positions]
+        valid[linear_idx] = False
+        valid[linear_idx[distances[positions].argmin()]] = True
+
+    return valid
+
+
+########################################################################################################################
 class CorrespondenceSearchNN(object):
     """
     search correspondences between two point clouds.
@@ -47,7 +67,10 @@ class CorrespondenceSearchNN(object):
         # run one mutual nearest neighbour search anyway
         correspondence = self.search_mutual(reference, source)
 
-        if self._method == 'mutual' and self._iter > 1:
+        if self._method not in ['mutual', 'closest']:
+            raise RuntimeError(f'method invalid: <{self._method}>')
+
+        elif self._method == 'mutual' and self._iter > 1:
             # run multiple iterations of mutual nearest neighbour search
             correspondence_new = correspondence
             reference_unpaired_global = np.arange(reference.shape[0])
@@ -57,7 +80,7 @@ class CorrespondenceSearchNN(object):
             for _ in range(self._iter - 1):
                 reference_unpaired = np.logical_not(reference_paired)
                 reference_unpaired_global = reference_unpaired_global[reference_unpaired]
-                source_unpaired = np.ones(source.shape[0], dtype=np.bool)
+                source_unpaired = np.ones(source.shape[0], dtype=bool)
                 source_unpaired[correspondence_new[reference_paired]] = False
                 source_unpaired_global = source_unpaired_global[source_unpaired]
                 if source_unpaired_global.shape[0] == 0 or reference_unpaired_global.shape[0] == 0:
@@ -83,7 +106,7 @@ class CorrespondenceSearchNN(object):
         elif self._method == 'closest':
             # for remaining points in reference, add the closest point in remaining points of source
             reference_unpaired = correspondence == -1
-            source_unpaired = np.ones(source.shape[0], dtype=np.bool)
+            source_unpaired = np.ones(source.shape[0], dtype=bool)
             source_unpaired[correspondence[np.logical_not(reference_unpaired)]] = False
             reference_idx = np.arange(reference.shape[0])[reference_unpaired]
             source_idx = np.arange(source.shape[0])[source_unpaired]
@@ -95,12 +118,13 @@ class CorrespondenceSearchNN(object):
 
             correspondence_new, distance = self.search_tree(reference, source)
             valid = distance < self._distance
+            valid = remove_multiples(correspondence_new, distance, valid)
             correspondence[reference_idx[valid]] = source_idx[correspondence_new[valid]]
 
             # for remaining points in source, add the closest point in remaining points of reference
             reference_unpaired = np.logical_not(valid)
             reference_idx = reference_idx[reference_unpaired]
-            source_unpaired = np.ones(source.shape[0], dtype=np.bool)
+            source_unpaired = np.ones(source.shape[0], dtype=bool)
             source_unpaired[correspondence_new[valid]] = False
             source_idx = source_idx[source_unpaired]
 
@@ -111,6 +135,7 @@ class CorrespondenceSearchNN(object):
 
             correspondence_inv, distance = self.search_tree(source, reference)
             valid = distance < self._distance
+            valid = remove_multiples(correspondence_inv, distance, valid)
             correspondence[reference_idx[correspondence_inv[valid]]] = source_idx[valid]
 
         return correspondence
@@ -153,7 +178,7 @@ class CorrespondenceSearchNN(object):
         pcd.points = source_o3d
         search_tree = o3d.geometry.KDTreeFlann(pcd)
 
-        c_idx = np.full((reference.shape[0], k), fill_value=-1, dtype=np.long)
+        c_idx = np.full((reference.shape[0], k), fill_value=-1, dtype=int)
         c_dist = np.zeros((reference.shape[0], k))
 
         for idx, point in enumerate(reference_o3d):

@@ -1,0 +1,35 @@
+{
+    "matcher": {
+        "exclude_bin": true,
+        "match_threshold": 0.1,
+        "min_matches": 30
+    },
+    "train": {
+        "batch": 18,
+        "epochs": 500,
+        "loaders": 8,
+        "loss": {
+            "use_score": true,
+            "score_loss_type": "lightglue",
+            "lambda_s": 1.0,
+            "inlier": 0.0025,
+            "matchability_by_distance": true
+        },
+        "learning_rate": 0.0001,
+        "save_interval": 20,
+        "early_stopping": 50,
+        "weight_decay": 0.0001,
+        "iteration": 1,
+        "performance_metric": "valid"
+    },
+    "val": {
+        "batch": 18,
+        "loaders": 8,
+        "sets": [
+            "test"
+        ],
+        "save": false,
+        "histogram_config": {},
+        "iteration": 1
+    }
+}

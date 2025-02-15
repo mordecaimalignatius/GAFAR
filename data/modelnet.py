@@ -14,11 +14,12 @@ import open3d as o3d
 from os.path import join, isfile, isdir
 from os import listdir
 from logging import getLogger
+from copy import deepcopy
 
 from torch.utils.data import Dataset
 
 from utils.distance import CorrespondenceSearchNN
-from utils.misc import merge_dict
+from utils.misc import merge_dict, range_from_str
 from utils.normals import EstimateNormals
 
 
@@ -36,26 +37,36 @@ class ModelNet40(Dataset):
     _default_config = {
         'source_randomize': True,
         'target_randomize': True,
-        'target_resample': False,
-        'min_correspondence': 0.0,
+        'target_resample': True,
         'prune_ratio': 0.7,
         'sets': {},
         'noise': {
-            'source': False,
-            'target': False,
-            'target_is_source': True,
-            'estimate_normals': False,  # re-estimate normals when using additive noise
+            'source': True,
+            'target': True,
+            'target_is_source': False,
+            'variance': 0.01,
+            'clip': True,
+            'clip_range': [-0.05, 0.05],
+            'estimate_normals': True,   # re-estimate normals when using additive noise
             'radius': 0.1,              # maximum distance of neighbours for normals estimation
             'neighbours': 30,           # maximum number of neighbours for normals estimation
+            'randomize_normals': True,  # randomize normal orientation (+/- sign flip)
         },
         'correspondence': {
-            'type': 'tree',
-            'distance': 0.01,
-            'method': 'mutual',
+            'distance': 0.0025,
+            'method': 'closest',
             'iters': 1,
         },
-        'normals': False,
-        'random_shard': False,
+        'transformation': {
+            'limits_rotation': 1.4,
+            'limits_translation': 0.5,
+            'canonical': False,
+        },
+        'registration_recall': {
+            'rotation': 1.0,
+            'translation': 0.1,
+        },
+        'normals': True,
     }
 
     def __init__(
@@ -64,7 +75,6 @@ class ModelNet40(Dataset):
             partition: str,
             start_id: int = 0,
             max_classes: int = 40,
-            max_try: int = 100,
             samples: list = None,
             samples_complement: bool = True,
     ):
@@ -73,7 +83,6 @@ class ModelNet40(Dataset):
         :param partition: dataset partition (usually 'test' or 'train')
         :param start_id : starting id for numbering the individual samples
         :param max_classes: maximum number of classes to consider when restricting dataset
-        :param max_try: maximum tries to find the required number of correspondences
         :param samples: which samples to take. if training/validation set come from same data source
         :param samples_complement: if complement of samples list is to be taken
 
@@ -85,9 +94,10 @@ class ModelNet40(Dataset):
         self._logger = getLogger(__name__)
 
         # if there are specific values for the partition merge them into standard config
-        self._config = merge_dict(self._default_config, config)
-        if partition in self._config['sets']:
-            self._config = merge_dict(self._config, config['sets'][partition])
+        self._full_config = merge_dict(self._default_config, config)
+        self._config = self._full_config
+        if partition in self._full_config['sets']:
+            self._config = merge_dict(self._full_config, config['sets'][partition])
 
         self._partition = partition
         self._start_id = start_id
@@ -96,14 +106,15 @@ class ModelNet40(Dataset):
         self._label = np.zeros((0,))
         self._classes = None
 
-        self._max_try = max_try
-
         self._prune = False
 
         self._config['noise']['estimate_normals'] = (
                 self._config['normals'] and self._config['noise']['estimate_normals'])
+        self._return_normals = self._config['normals']
         self._normals = EstimateNormals(
-            knn=self._config['noise']['neighbours'], distance=self._config['noise']['radius'])
+            knn=self._config['noise']['neighbours'], distance=self._config['noise']['radius'],
+            randomize=self._config['noise']['randomize_normals'],
+        )
 
         if "points" in self._config:
             self._logger.info(f'using dataset \"{partition.upper()}\" with {self._config["points"]} points')
@@ -111,17 +122,9 @@ class ModelNet40(Dataset):
         else:
             self._config['points'] = None
 
+        self._correspondence_search = None
         if self._config['target_resample'] or not self._config['noise']['target_is_source']:
             self._correspondence_search = CorrespondenceSearchNN(**self._config['correspondence'])
-            if self._config['min_correspondence'] > 1.:
-                self._logger.warning('minimum correspondence ratio must be in range [0., 1.)')
-                self._config['min_correspondence'] = 1.
-
-            if self._config['points'] is not None:
-                self._min_correspondence = int(self._config['points'] * self._config['min_correspondence'])
-
-                if self._prune:
-                    self._min_correspondence = int(self._min_correspondence * self._config['prune_ratio'])
 
         if 'classes' in self._config:
             if isinstance(self._config['classes'], str):
@@ -136,13 +139,10 @@ class ModelNet40(Dataset):
 
                 else:
                     self._classes = [x for x in range(start, stop)]
-
             elif isinstance(self._config['classes'], np.ndarray):
                 self._classes = self._config['classes']
-
             elif isinstance(self._config['classes'], list):
                 self._classes = np.array(self._config['classes'])
-
             else:
                 self._logger.error(f'can\'t handle classes information of type {str(type(self._config["classes"]))}')
                 self._classes = None
@@ -150,17 +150,20 @@ class ModelNet40(Dataset):
             if self._classes is not None:
                 self._logger.info(f'using classes: {self._classes}')
 
+        self._source_variance = self._config['noise']['variance'] if self._config['noise']['source'] else None
+        self._target_variance = (self._config['noise']['target_variance'] if 'target_variance' in self._config['noise']
+                                 else self._config['noise']['variance']) if self._config['noise']['target'] else None
+        self._rotation = self._config['transformation']['limits_rotation']
         self._do_augment = (self._config['noise']['source'] or self._config['noise']['target']) or \
-                           ('sampling' in self._config and (
-                                    self._config['sampling']['limits_rotation'] != 0. or
-                                    self._config['sampling']['limits_translation'] != 0.))
+                           ('transformation' in self._config and (
+                                   self._config['transformation']['limits_rotation'] != 0. or
+                                   self._config['transformation']['limits_translation'] != 0.))
 
         # determine loading operation
         if 'archives' in self._config:
             # read archives
             self._get_archives()
             self._get_element = self._get_single_pcd
-
         else:
             # folder traversal, read meshes from disk
             # dataset root path in config['source_path']
@@ -181,32 +184,28 @@ class ModelNet40(Dataset):
 
                 if samples_complement:
                     # get complement of samples
-                    samples_indices = np.ones((num_samples,), dtype=np.bool)
+                    samples_indices = np.ones((num_samples,), dtype=bool)
                     samples_indices[samples] = False
                     self._items = np.arange(num_samples)[samples_indices]
+                else:
+                    self._items = samples
 
             else:
                 # get item indices randomly for desired portion of dataset
-                if self._config['shard'] > 1.:
+                start, stop = range_from_str(self._config['shard'])
+                if (stop - start) <= 0.0:
                     self._logger.error(f'invalid entry for \"shard\" in config ({self._config["shard"]}), ignoring')
-                    self._config['shard'] = 1.
-
-                elif self._config['random_shard']:
-                    # random self._config['shard']% of elements
-                    self._items = np.random.choice(
-                        num_samples,
-                        size=int(num_samples * self._config['shard']),
-                        replace=False
-                    )
+                    self._items = np.arange(num_samples)
                 else:
                     # first self._config['shard']% of elements
-                    self._items = np.arange(int(num_samples * self._config['shard']))
+                    start = int(num_samples * start)
+                    stop = int(num_samples * stop)
+                    self._items = np.arange(start, stop)
 
             # do the sampling
             if isinstance(self._data, list):
                 self._data = [self._data[x] for x in self._items]
                 self._label = [self._label[x] for x in self._items]
-
             else:
                 # numpy array
                 self._data = self._data[self._items]
@@ -334,18 +333,13 @@ class ModelNet40(Dataset):
 
                 else:
                     self._logger.warning(
-                        f"ModelNet40: don't know how to handle archive \"{arch_path}\", skipping")
+                        f"{self.__class__}: don't know how to handle archive \"{arch_path}\", skipping")
 
                 # point cloud length info and dependent settings, if not yet available
                 if 'points' not in self._config or self._config['points'] is None:
                     self._config['points'] = cur_data.shape[1]
                     self._logger.info(f'point cloud size: {self._config["points"]}')
                     self._set_prune()
-
-                    if self._config['target_resample']:
-                        self._min_correspondence = int(self._config['points'] * self._config['min_correspondence'])
-                        if self._prune:
-                            self._min_correspondence = int(self._min_correspondence * self._config['prune_ratio'])
 
                 if self._classes is not None:
                     keep_idx = np.isin(cur_label, self._classes).flatten()
@@ -356,7 +350,7 @@ class ModelNet40(Dataset):
                 label.append(cur_label)
 
         if len(data) == 0:
-            raise RuntimeError('ModelNet40: no valid archives found')
+            raise RuntimeError(f'{self.__class__}: no valid archives found')
 
         self._data = np.concatenate(data, axis=0)
         self._label = np.concatenate(label, axis=0)
@@ -364,16 +358,17 @@ class ModelNet40(Dataset):
     def _get_single_pcd(self, item) -> np.ndarray:
         return self._data[item]
 
-    def __getitem__(self, item: int):
+    def __getitem__(self, item: int) -> dict[str, np.ndarray]:
         """
-        returns an example for registration consisting of:
-            source point cloud
-            target point cloud
-            rotation source->target
-            translation source->target
-            class label
-            model id (multiple noise variations have the same id)
-            full and clean original point cloud (no sub-sampling, no noise)
+        returns an example for registration as a dictionary with keys:
+            points_src:     source point cloud
+            points_ref:     target point cloud
+            points_clean:   noise free, joint source and reference point clouds in coordinate system of points_ref
+            rotation:       rotation source->target
+            translation:    translation source->target
+            label:          class label
+            id:             model id (multiple noise variations have the same id)
+            crop:           information about the cropping/pruning of point clouds and approximate remaining overlap
 
         :param item:
         :return:
@@ -396,8 +391,8 @@ class ModelNet40(Dataset):
         source_noise = 0.
         if self._config['noise']['source']:
             source_noise = np.random.normal(
-                scale=self._config['noise']['source_variance'],
-                size=(self._config['points'], 3),
+                scale=self._source_variance,
+                size=(pcd_source.shape[0], 3),
             ).astype(pcd_source.dtype)
 
             if 'clip' in self._config['noise'] and self._config['noise']['clip']:
@@ -411,11 +406,6 @@ class ModelNet40(Dataset):
             if self._config['noise']['estimate_normals']:
                 # old open3d version: 0.15.2
                 pcd_source[:, 3:6] = self._normals(pcd_source)
-
-        # do random pruning on the source point cloud
-        if self._prune:
-            reestablish_correspondences = True
-            pcd_source = self._prune_point_cloud(pcd_source)
 
         # resample target points? no 1:1 correspondences anymore
         if self._config['target_resample']:
@@ -435,9 +425,8 @@ class ModelNet40(Dataset):
             else:
                 reestablish_correspondences = True
                 target_noise = np.random.normal(
-                    scale=self._config['noise']['target_variance'] if 'target_variance' in self._config['noise']
-                    else self._config['noise']['source_variance'],
-                    size=(self._config['points'], 3),
+                    scale=self._target_variance,
+                    size=(pcd_target.shape[0], 3),
                 ).astype(pcd_target.dtype)
 
                 if 'clip' in self._config['noise'] and self._config['noise']['clip']:
@@ -451,8 +440,11 @@ class ModelNet40(Dataset):
             if self._config['noise']['estimate_normals']:
                 pcd_target[:, 3:6] = self._normals(pcd_target)
 
+        # do random pruning on the source point cloud
         # do random pruning on target point clouds independently
         if self._prune:
+            reestablish_correspondences = True
+            pcd_source = self._prune_point_cloud(pcd_source)
             pcd_target = self._prune_point_cloud(pcd_target)
 
         if reestablish_correspondences:
@@ -464,20 +456,19 @@ class ModelNet40(Dataset):
 
         else:
             correspondence = np.arange(0, self._config['points'], dtype=np.int32)
-
             if self._config['target_randomize']:
                 np.random.shuffle(correspondence)
                 pcd_target = pcd_target[correspondence]
 
         # remove canonical orientation of examples
-        if not self._config['sampling']['canonical']:
+        if not self._config['transformation']['canonical']:
             rot_uncanon, _ = self.random_rt(r_lim=np.pi)
 
             pcd_source[:, :3] = pcd_source[:, :3].dot(rot_uncanon)
             pcd_target[:, :3] = pcd_target[:, :3].dot(rot_uncanon)
             pcd_clean[:, :3] = pcd_clean[:, :3].dot(rot_uncanon)
 
-            if self._config['normals']:
+            if self._return_normals:
                 pcd_source[:, 3:] = pcd_source[:, 3:].dot(rot_uncanon)
                 pcd_target[:, 3:] = pcd_target[:, 3:].dot(rot_uncanon)
                 pcd_clean[:, 3:] = pcd_clean[:, 3:].dot(rot_uncanon)
@@ -486,11 +477,22 @@ class ModelNet40(Dataset):
         # target = source * rot + t
         # target = source.dot(rot.T) + t
         pcd_source[:, :3] = (pcd_source[:, :3] - t).dot(rot)
-        if self._config['normals']:
+        if self._return_normals:
             pcd_source[:, 3:] = pcd_source[:, 3:].dot(rot)
 
         # return example
-        return pcd_source, pcd_target, correspondence, rot, t, self._label[idx], idx + self._start_id, pcd_clean
+        sample = {
+            'points_src': pcd_source,
+            'points_ref': pcd_target,
+            'correspondence': correspondence,
+            'rotation': rot,
+            'translation': t,
+            'label': self._label[idx],
+            'id': idx + self._start_id,
+            'points_clean': pcd_clean,
+        }
+
+        return sample
 
     def _prune_point_cloud(self, points):
         plane = np.random.random((3,)) - 0.5
@@ -541,9 +543,9 @@ class ModelNet40(Dataset):
 
         """
         if r_lim is None:
-            r_lim = self._config['sampling']['limits_rotation']
+            r_lim = self._rotation
         if t_lim is None:
-            t_lim = self._config['sampling']['limits_translation']
+            t_lim = self._config['transformation']['limits_translation']
 
         t = (np.random.random(size=(3,)) - .5) * 2. * t_lim
 
@@ -575,11 +577,20 @@ class ModelNet40(Dataset):
         return self._items
 
     @property
+    def get_normals_parameter(self) -> dict:
+        return {'nn': self._config['noise']['neighbours'], 'radius': self._config['noise']['radius']}
+
+    @property
     def config(self) -> dict:
         """ hand back config with default settings """
-        if hasattr(self, '_correspondence_search'):
-            config = {**self._config, 'correspondence': self._correspondence_search.config}
-        else:
-            config = {**self._config}
+        return deepcopy(self._full_config)
 
-        return config
+    @property
+    def points(self) -> int:
+        """ return number of points the data item will have """
+        if self._prune:
+            return self._prune_points
+        return self._config['points']
+
+    def normals(self, value: bool = True):
+        self._return_normals = value

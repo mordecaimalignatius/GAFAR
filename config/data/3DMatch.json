@@ -1,0 +1,45 @@
+{
+  "dataset": {
+    "type": "3dmatch",
+    "path": "set/me/to/dataset/root",
+    "points": 1024,
+    "translation_good": 0.1,
+    "registration_recall": {
+      "rotation": 1.0,
+      "translation": 0.1,
+      "rmse": 0.2
+    },
+    "sets": {
+      "train": {
+        "orientation": {
+          "augment": true
+        },
+        "transformation": {
+          "augment": true
+        },
+        "reversal": {
+          "augment": true
+        },
+        "noise": {
+          "augment": true
+        }
+      }
+    },
+    "correspondence": {
+      "distance": 0.01
+    },
+    "orientation": {
+      "augment": false
+    },
+    "transformation": {
+      "augment": false
+    },
+    "reversal": {
+      "augment": false
+    },
+    "noise": {
+      "augment": false
+    },
+    "overlap_min": 0.0
+  }
+}

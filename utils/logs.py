@@ -16,7 +16,7 @@ from numbers import Number
 
 ################################################################################
 def get_logger(
-        path: Union[Path, str],
+        path: Union[Path, str, None],
         level: str = 'INFO',
         colored: bool = False,
         fmt: str = '%(asctime)s [%(levelname)s] %(name)s - %(message)s',
@@ -29,14 +29,15 @@ def get_logger(
     :param fmt: format string passed to logging.Formatter
     :return: logger
     """
-    if isinstance(path, str):
-        path = Path(path)
+    if path is not None:
+        if isinstance(path, str):
+            path = Path(path)
 
-    log_path = path.parent
-    log_path.mkdir(parents=True, exist_ok=True)
+        log_path = path.parent
+        log_path.mkdir(parents=True, exist_ok=True)
 
-    if not path.suffix == '.log':
-        path = path.with_suffix('.log')
+        if not path.suffix == '.log':
+            path = path.with_suffix('.log')
 
     log_level_numeric = getattr(logging, level)
     logger = logging.getLogger()
@@ -50,16 +51,27 @@ def get_logger(
 
     handler = logging.FileHandler(path)
     formatter = logging.Formatter(fmt=fmt)
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    if not logger.hasHandlers():
+        # set a stream handler if it does not exist
+        console = logging.StreamHandler()
+        console.setFormatter(formatter)
+        logger.addHandler(console)
 
-    logger.info(f'Saving output and logs to {path}')
+    if path is not None:
+        handler = logging.FileHandler(path)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    if path is not None:
+        logger.info(f'Saving output and logs to {path}')
+    else:
+        logger.info('not saving to file')
 
     return logger
 
 
 ################################################################################
-def get_tensorboard_log_path(path: Union[Path, str], resume: bool = False) -> Path:
+def get_tensorboard_log_path(path: Union[Path, str], resume: bool = False, val: bool = False) -> Path:
     """
     return the next/a tensorboard logging path
     $path/runs/expN
@@ -76,7 +88,7 @@ def get_tensorboard_log_path(path: Union[Path, str], resume: bool = False) -> Pa
     if isinstance(path, str):
         path = Path(path)
     path = path.absolute()
-    if 'runs' in path.parts:
+    if not val and 'runs' in path.parts:
         # get runs directory
         last_name = ''
         while path.name != 'runs':
@@ -87,11 +99,14 @@ def get_tensorboard_log_path(path: Union[Path, str], resume: bool = False) -> Pa
         if resume:
             return path / last_name
 
-    else:
+    elif val and path.name.startswith('exp'):
+        # evaluation, base directory of experiment runs/expX provided
+        path = path / 'val'
+    elif not val:
         path = path / 'runs'
 
     if not path.exists():
-        return path / 'exp1'
+        return path / 'exp0'
 
     dirs = [x for x in path.iterdir()]
     parser = parse.compile('exp{:d}')
@@ -99,10 +114,10 @@ def get_tensorboard_log_path(path: Union[Path, str], resume: bool = False) -> Pa
     nums = [x[0] for x in [parser.parse(x.name) for x in dirs] if x is not None]
     last_dir = max(nums) if len(nums) > 0 else 0
 
-    if resume and len(dirs):
-        return dirs[nums.index(last_dir)]
+    if not (resume and len(dirs)):
+        last_dir += 1
 
-    return path / f'exp{last_dir+1:d}'
+    return path / f'exp{last_dir:d}'
 
 
 ################################################################################
@@ -165,7 +180,7 @@ def matching_results_to_tensorboard(
 
     write_scalars(writer, f'{mode}/metrics/chamfer', results['chamfer_distance'], epoch)
     if getattr(criterion, "has_score_loss", False):
-        if mode == 'train':
+        if mode == 'train' and 'dust_bin_score' in results:
             write_scalars(writer, f'{mode}/misc/dust_bin', results['dust_bin_score'], epoch)
 
         write_scalars(writer, f'{mode}/metrics/precision_all', results['precision'], epoch)
@@ -185,9 +200,19 @@ def matching_results_to_tensorboard(
         write_scalars(writer, f'{mode}/metrics/chamfer_valid', results['chamfer_distance_valid'], epoch)
         write_scalars(writer, f'{mode}/misc/valid', results['valid'], epoch)
 
+        if 'registration_recall' in results:
+            write_scalars(writer, f'{mode}/metrics/registration_recall', results['registration_recall'], epoch)
+            write_scalars(
+                writer, f'{mode}/metrics/registration_recall_valid', results['registration_recall_valid'], epoch)
+
+        write_scalars(writer, f'{mode}/metrics/inlier_ratio', results['inlier_ratio'], epoch)
+        write_scalars(writer, f'{mode}/metrics/inlier_ratio_valid', results['inlier_ratio_valid'], epoch)
+
     write_scalars(writer, f'{mode}/metrics/rotation_error_nn', results['rotation_error_nn'], epoch)
     write_scalars(writer, f'{mode}/metrics/translation_error_nn', results['translation_error_nn'], epoch)
     write_scalars(writer, f'{mode}/metrics/chamfer_nn', results['chamfer_distance_nn'], epoch)
+    if 'registration_recall_nn' in results:
+        write_scalars(writer, f'{mode}/metrics/registration_recall_nn', results['registration_recall_nn'], epoch)
     write_scalars(writer, f'{mode}/misc/correspondences', results['correspondences'], epoch)
     write_scalars(writer, f'{mode}/misc/count', results['count'][-1], epoch)
 
@@ -195,6 +220,7 @@ def matching_results_to_tensorboard(
         write_scalars(writer, f'{mode}/time/epoch', results['time_train'] / 60., epoch)
         write_scalars(writer, f'{mode}/time/model_update', results['time'] / 60., epoch)
         write_scalars(writer, f'{mode}/time/batch_sum', results['time_batch'] / 60., epoch)
+        write_scalars(writer, f'{mode}/time/update', results['time_update'] / 60., epoch)
 
 
 ################################################################################
@@ -220,15 +246,17 @@ def matching_log_result(result: dict, logger: logging.Logger, criterion=None, pr
     logger.info(prepend + loss_str)
 
     if getattr(criterion, 'has_score_loss', False):
-        logger.info(
-            prepend +
-            f'P  : {array2str(result["precision"], p="8.4f")}  '
-            f'R  : {array2str(result["recall"], p="8.4f")}  '
-            f'PM : {array2str(result["precision_match"], p="8.4f")}  '
-            f'RM : {array2str(result["recall_match"], p="8.4f")}  '
-            f'C  : {result["correspondences"][0]:8.2f}  '
-            f'M  : {array2str(result["matches_predicted"], p="8.2f")}  '
-            f'M/t: {array2str(result["matches_predicted_threshold"], p="8.2f")}')
+        metrics = prepend + \
+            f'P  : {array2str(result["precision"], p="8.4f")}  '\
+            f'R  : {array2str(result["recall"], p="8.4f")}  '\
+            f'PM : {array2str(result["precision_match"], p="8.4f")}  '\
+            f'RM : {array2str(result["recall_match"], p="8.4f")}  '\
+            f'C  : {result["correspondences"][0]:8.2f}  '\
+            f'M  : {array2str(result["matches_predicted"], p="8.2f")}  '\
+            f'M/t: {array2str(result["matches_predicted_threshold"], p="8.2f")}  '
+
+        logger.info(metrics)
+
     metric_str = ''
     if getattr(criterion, 'has_score_loss', False):
         metric_str += f'Re : {array2str(result["rotation_error"], p="8.5f")}  ' \
@@ -242,14 +270,33 @@ def matching_log_result(result: dict, logger: logging.Logger, criterion=None, pr
                       f'TeN: {array2str(result["translation_error_nn"], p="8.5f")}  ' \
                       f'CDN: {array2str(result["chamfer_distance_nn"], p="8.6f")}'
     logger.info(prepend + metric_str)
+
+    # registration recall and inlier ratio
+    metric_str = ''
+    if getattr(criterion, 'has_score_loss', False):
+        if 'registration_recall' in result:
+            metric_str += f'RR : {array2str(result["registration_recall"], p="8.3f")}  ' \
+                          f'RRV: {array2str(result["registration_recall_valid"], p="8.3f")}  '
+    if 'registration_recall_nn' in result:
+        metric_str += f'RRN: {array2str(result["registration_recall_nn"], p="8.3f")}  '
+    if getattr(criterion, 'has_score_loss', False):
+        metric_str += f'IR : {array2str(result["inlier_ratio"], p="8.3f")}  '\
+                      f'IRV: {array2str(result["inlier_ratio_valid"], p="8.3f")}  '
+    if len(metric_str):
+        logger.info(prepend + metric_str)
+
+    general_info_str = ''
     if criterion.has_score_loss:
-        logger.info(
-            prepend +
-            f'Wmax: {array2str(result["wrong_score_max"])}  '
-            f'Wmin: {array2str(result["wrong_score_min"])}  '
-            f'Wavg: {array2str(result["wrong_score_avg"])}  ' +
-            (f'DB: {array2str(result["dust_bin_score"], p="4.2f")}  '
-             f'tt: {result["time_train"] / 60.:.2f}  '
-             f'mu: {array2str(result["time"] / 60., p=".2f")}  '
-             f'bt: {array2str(result["time_batch"] / 60., p=".2f")}') if mode == 'train' else ''
-        )
+        general_info_str += f'Wmax: {array2str(result["wrong_score_max"])}  '\
+                          f'Wmin: {array2str(result["wrong_score_min"])}  '\
+                          f'Wavg: {array2str(result["wrong_score_avg"])}  '
+        if 'dust_bin_score' in result:
+            general_info_str += f'DB: {array2str(result["dust_bin_score"], p="4.2f")}  '
+
+    if mode == 'train':
+        general_info_str += f'tt: {result["time_train"] / 60.:.2f}  '\
+                            f'mu: {array2str(result["time"] / 60., p=".2f")}  '\
+                            f'bt: {array2str(result["time_batch"] / 60., p=".2f")}   '\
+                            f'ut: {array2str(result["time_update"] / 60., p=".2f")}'
+
+    logger.info(prepend + general_info_str)

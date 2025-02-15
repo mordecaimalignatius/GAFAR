@@ -8,7 +8,7 @@ def parse_args(description):
     parser.add_argument('--cfg', dest='cfg_file', action='append',
                         help='an optional config file', default=None, type=str)
     parser.add_argument('--batch', dest='batch_size',
-                        help='batch size', default=None, type=int)
+                        help='batch size', default=18, type=int)
     parser.add_argument('--epoch', dest='epoch',
                         help='epoch number', default=None, type=int)
     parser.add_argument('--model', dest='model',
@@ -18,12 +18,17 @@ def parse_args(description):
     parser.add_argument('--loader', dest='data_loader',
                         help='number of dataloaders', default=None, type=int)
     parser.add_argument('--output', type=str, default=None, help='output path override')
-    parser.add_argument('--reg_iter', type=int, default=2, help='registration iteration override')
+    parser.add_argument('--reg_iter', type=int, default=1, help='registration iteration override')
     parser.add_argument('--seed', type=int, default=None, help='random seed to use.')
     parser.add_argument('--non_deterministic', action='store_true', help='deactivate deterministic testing')
-    parser.add_argument('--threshold', type=float, default=0.5, help='Score matrix threshold for matches.')
-    parser.add_argument('--matches-min', type=int, default=3,
+    parser.add_argument('--threshold', type=float, default=0.1, help='Score matrix threshold for matches.')
+    parser.add_argument('--matches-min', type=int, default=30,
                         help='minimum number of matches to consider a registration successful.')
+    parser.add_argument('--discard-bin', action='store_true',
+                        help='Discard dust bin row/col for correspondence search.')
+    parser.add_argument('--reject', type=float, default=0.05,
+                        help='Reject outliers with residual point distance larger than this value. '
+                             'Disable with value <= 0.0')
     args = parser.parse_args()
 
     # load cfg from file

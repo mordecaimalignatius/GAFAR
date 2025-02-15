@@ -1,0 +1,30 @@
+{
+  "model": {
+    "type": "GAFARv2",
+    "feature_dimension": 128,
+    "head": {"type": "matchable"},
+    "matcher": {
+      "attention": "softmax",
+      "layers": ["gpt-self", "gpt-cross", "gpt-self", "gpt-cross", "gpt-self", "gpt-cross", "gpt-self", "gpt-cross", "gpt-self", "gpt-cross", "gpt-self", "gpt-cross", "gpt-self", "gpt-cross", "gpt-self", "gpt-cross", "gpt-self", "gpt-cross"],
+      "norm": {
+        "type": "batch"
+      },
+      "heads": 2
+    },
+    "feature": {
+      "type": "dgcnn-radius",
+      "embedding": [512, 256],
+      "encoder": [64, 64, 128, 256],
+      "dropout": false,
+      "norm": "batch",
+      "neighbourhood": {
+        "radius": 0.15,
+        "min": 5
+      }
+    },
+    "fusion": {
+      "norm": "batch"
+    },
+    "normals": true
+  }
+}

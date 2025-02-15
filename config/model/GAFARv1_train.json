@@ -1,0 +1,20 @@
+{
+  "train": {
+    "batch": 20,
+    "epochs": 1000,
+    "loaders": 8,
+    "loss": {
+      "use_score": true,
+      "score_loss_type": "rgm",
+      "lambda_s": 1.0
+    },
+    "learning_rate": 1e-4,
+    "iteration": 1,
+    "early_stopping": 100
+  },
+  "val": {
+    "batch": 20,
+    "iteration": 2,
+    "loaders": 8
+  }
+}
